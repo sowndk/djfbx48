@@ -558,7 +558,8 @@
     align-items: center;
     background-color: #fcfcfc;
     border-top: 1px solid #f0f0f0;
-    padding: 5px 0;
+     padding-top: 5px;
+    padding-bottom: max(5px, env(safe-area-inset-bottom));
     flex-shrink: 0;
     height: auto;
     position: fixed;
