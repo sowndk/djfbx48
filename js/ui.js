@@ -719,6 +719,7 @@ function applyGlobalFont(fontUrl) {
     }
 }
 
+// 更新全局CSS，支持占位符动态替换
 function applyGlobalCss(css) {
     const styleId = 'global-css-style';
     let styleElement = document.getElementById(styleId);
@@ -729,7 +730,27 @@ function applyGlobalCss(css) {
         document.head.appendChild(styleElement);
     }
     
-    styleElement.innerHTML = css || '';
+    let finalCss = css || '';
+
+    if (finalCss && typeof currentChatId !== 'undefined' && currentChatId && typeof db !== 'undefined') {
+        const chat = db.characters.find(c => c.id === currentChatId) || db.groups.find(g => g.id === currentChatId);
+        if (chat) {
+            // 精准提取五大数据
+            const charAvatar = chat.avatar || 'https://i.postimg.cc/Y96LPskq/o-o-2.jpg';
+            const charRemark = chat.remarkName || chat.realName || chat.name || '';
+            const charRealName = chat.realName || chat.name || chat.remarkName || ''; // 提取本名
+            const userAvatar = chat.myAvatar || 'https://i.postimg.cc/GtbTnxhP/o-o-1.jpg';
+            const userName = chat.myName || (chat.me && chat.me.nickname) || '我';
+
+            // 万能替换（新增真名替换）
+            finalCss = finalCss.replace(/\{\{char_avatar\}\}/g, charAvatar);
+            finalCss = finalCss.replace(/\{\{char_remark\}\}/g, charRemark);
+            finalCss = finalCss.replace(/\{\{user_avatar\}\}/g, userAvatar);
+            finalCss = finalCss.replace(/\{\{user_name\}\}/g, userName);
+        }
+    }
+    
+    styleElement.innerHTML = finalCss;
 }
 
 function applyFontSize(scale) {
