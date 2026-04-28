@@ -104,21 +104,7 @@ async function getAiReply(chatId, chatType, isBackground = false, isSummary = fa
     }
 
     try {
-        let systemPrompt, requestBody;
-        if (chatType === 'private') {
-            systemPrompt = generatePrivateSystemPrompt(chat, { isPhoneControlRevokeAttempt });
-        } else {
-            // generateGroupSystemPrompt 应该在 group_chat.js 中定义
-            if (typeof generateGroupSystemPrompt === 'function') {
-                systemPrompt = generateGroupSystemPrompt(chat);
-            } else {
-                systemPrompt = "Group chat system prompt not available.";
-            }
-        }
-
-        // 添加聊天记录提示
-        systemPrompt += "\n\n以下为当前聊天记录：\n";
-        
+        let requestBody;
         let historySlice = chat.history.slice(-chat.maxMemory);
         
         // 节点系统：上下文截断与记忆隔离
@@ -210,11 +196,63 @@ async function getAiReply(chatId, chatType, isBackground = false, isSummary = fa
             return true;
         });
 
+        // === 【新增】提取触发消息与格式化历史记录 ===
+        let lastAiIndex = -1;
+        for (let i = historySlice.length - 1; i >= 0; i--) {
+            if (historySlice[i].role === 'assistant' || historySlice[i].role === 'char') {
+                lastAiIndex = i;
+                break;
+            }
+        }
+        
+        let historyForText = [];
+        let triggerMessages = [];
+        
+        if (lastAiIndex === -1) {
+            triggerMessages = historySlice;
+        } else {
+            historyForText = historySlice.slice(0, lastAiIndex + 1);
+            triggerMessages = historySlice.slice(lastAiIndex + 1);
+        }
+        
+        if (triggerMessages.length === 0) {
+            triggerMessages = [{
+                role: 'user',
+                content: '[{{user}}没回你，请继续对话。]',
+                timestamp: Date.now()
+            }];
+        }
+
+        let historyText = '';
+        if (historyForText.length > 0) {
+            const historyLines = historyForText.map(m => {
+                let content = m.content || '';
+                if (m.parts && m.parts.length > 0) {
+                    content = m.parts.map(p => p.text || '[图片]').join('');
+                }
+                const senderName = m.role === 'user' ? chat.myName : (m.senderId ? (chat.members?.find(mem => mem.id === m.senderId)?.groupNickname || '未知') : chat.realName);
+                return `${senderName}: ${content}`;
+            });
+            historyText = `<chat_history>\n【近期聊天记录】\n以下是我们刚刚的聊天记录，作为背景查看：\n${historyLines.join('\n')}\n</chat_history>\n\n`;
+        }
+        // ==========================================
+
+        let systemPrompt;
+        if (chatType === 'private') {
+            systemPrompt = generatePrivateSystemPrompt(chat, { isPhoneControlRevokeAttempt, historyText });
+        } else {
+            if (typeof generateGroupSystemPrompt === 'function') {
+                systemPrompt = generateGroupSystemPrompt(chat, { historyText });
+            } else {
+                systemPrompt = "Group chat system prompt not available.";
+            }
+        }
+
         if (provider === 'gemini') {
             let lastMsgTimeForAI = 0;
-            const contents = historySlice.map(msg => {
-                const role = (msg.role === 'assistant' || msg.role === 'char') ? 'model' : 'user';
-                
+            let mergedParts = [];
+            
+            triggerMessages.forEach((msg, index) => {
                 let prefix = '';
                 const currentMsgTime = msg.timestamp;
                 const timeDiff = currentMsgTime - lastMsgTimeForAI;
@@ -297,8 +335,21 @@ async function getAiReply(chatId, chatType, isBackground = false, isSummary = fa
                     parts[0].text = '[id:' + msg.id + ']\n' + parts[0].text;
                 }
 
-                return {role, parts};
+                if (index > 0 && mergedParts.length > 0 && mergedParts[mergedParts.length - 1].text && parts.length > 0 && parts[0].text) {
+                    mergedParts[mergedParts.length - 1].text += '\n\n' + parts[0].text;
+                    mergedParts.push(...parts.slice(1));
+                } else if (index > 0 && mergedParts.length > 0 && parts.length > 0 && parts[0].text) {
+                    parts[0].text = '\n\n' + parts[0].text;
+                    mergedParts.push(...parts);
+                } else {
+                    mergedParts.push(...parts);
+                }
             });
+
+            const contents = [];
+            if (mergedParts.length > 0) {
+                contents.push({ role: 'user', parts: mergedParts });
+            }
 
             if (isBackground) {
                 contents.push({
@@ -324,8 +375,10 @@ async function getAiReply(chatId, chatType, isBackground = false, isSummary = fa
             const messages = [{role: 'system', content: systemPrompt}];
             
             let lastMsgTimeForAI = 0;
+            let mergedContent = [];
+            let hasImage = false;
             
-            historySlice.forEach(msg => {
+            triggerMessages.forEach((msg, index) => {
                let content;
                let prefix = '';
                
@@ -407,14 +460,31 @@ async function getAiReply(chatId, chatType, isBackground = false, isSummary = fa
                            content[0].text = '[id:' + msg.id + ']\n' + content[0].text;
                        }
                    }
-                   const apiRole = msg.role === 'char' ? 'assistant' : msg.role;
+                   
                    if (typeof content === 'string') {
-                       messages.push({role: apiRole, content: content});
-                   } else {
-                       messages.push({role: apiRole, content: content});
+                       content = [{type: 'text', text: content}];
                    }
                }
+               
+               if (index > 0 && mergedContent.length > 0 && mergedContent[mergedContent.length - 1].type === 'text' && content.length > 0 && content[0].type === 'text') {
+                   mergedContent[mergedContent.length - 1].text += '\n\n' + content[0].text;
+                   mergedContent.push(...content.slice(1));
+               } else if (index > 0 && mergedContent.length > 0 && content.length > 0 && content[0].type === 'text') {
+                   content[0].text = '\n\n' + content[0].text;
+                   mergedContent.push(...content);
+               } else {
+                   mergedContent.push(...content);
+               }
             });
+
+            if (mergedContent.length > 0) {
+                if (hasImage) {
+                    messages.push({ role: 'user', content: mergedContent });
+                } else {
+                    const textContent = mergedContent.map(c => c.text).join('');
+                    messages.push({ role: 'user', content: textContent });
+                }
+            }
 
             // === 【第三步：处理后台通知与 CoT 序列】 ===
             
@@ -492,9 +562,10 @@ async function getAiReply(chatId, chatType, isBackground = false, isSummary = fa
                 }
             }
 
+            const outgoingMessages = normalizeMessagesForProvider(messages, provider);
             requestBody = {
                 model: model, 
-                messages: messages, 
+                messages: outgoingMessages, 
                 stream: streamEnabled,
                 temperature: db.apiSettings.temperature !== undefined ? db.apiSettings.temperature : 1.0
             };
@@ -643,27 +714,26 @@ async function processStream(response, chat, apiType, targetChatId, targetChatTy
     await handleAiReplyContent(fullResponse, chat, targetChatId, targetChatType, isBackground, isCharBlockedMonologue);
 }
 
-/** 返回该角色在手机掌控下可见的角色与群聊（未开启分组过滤则返回全部，开启则只返回指定文件夹内） */
+/** 返回该角色在手机掌控下可见的角色与群聊（未开启角色过滤则返回全部，开启则只返回指定的角色及所在群聊） */
 function getPhoneControlVisibleChats(controllingChar) {
-    if (!controllingChar.phoneControlFolderFilterEnabled || !controllingChar.phoneControlVisibleFolderIds || controllingChar.phoneControlVisibleFolderIds.length === 0) {
+    if (!controllingChar.phoneControlCharFilterEnabled || !controllingChar.phoneControlVisibleCharIds || controllingChar.phoneControlVisibleCharIds.length === 0) {
         return {
             characters: (db.characters || []).filter(c => c.id !== controllingChar.id),
             groups: db.groups || []
         };
     }
-    const visibleIds = controllingChar.phoneControlVisibleFolderIds;
-    const includeNoFolder = visibleIds.includes('__no_folder__');
-    const folderIds = visibleIds.filter(id => id !== '__no_folder__');
+    const visibleIds = controllingChar.phoneControlVisibleCharIds;
     const characters = (db.characters || []).filter(c => {
         if (c.id === controllingChar.id) return false;
-        if (!c.folderId && includeNoFolder) return true;
-        if (c.folderId && folderIds.includes(c.folderId)) return true;
+        if (visibleIds.includes(c.id)) return true;
         return false;
     });
+    
+    // 群聊如果包含任意一个可见角色，则也视为可见
     const groups = (db.groups || []).filter(g => {
-        if (!g.folderId && includeNoFolder) return true;
-        if (g.folderId && folderIds.includes(g.folderId)) return true;
-        return false;
+        if (!g.members || g.members.length === 0) return false;
+        // 群聊成员里有没有在可见角色列表中的
+        return g.members.some(m => visibleIds.includes(m.originalCharId));
     });
     return { characters, groups };
 }
@@ -1154,7 +1224,11 @@ async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChat
 
                     if (originalMessage) {
                         let filteredReplyText = replyText;
-                        if (typeof applyRegexFilter === 'function') filteredReplyText = applyRegexFilter(replyText, targetChatId);
+                        if (typeof applyRegexFilter === 'function') {
+                            filteredReplyText = applyRegexFilter(replyText, targetChatId);
+                        }
+                        if (filteredReplyText === '') continue; // 如果过滤后内容为空，直接丢弃该条消息
+
                         const message = {
                             id: `msg_${Date.now()}_${Math.random()}`,
                             role: 'assistant',
@@ -1174,7 +1248,11 @@ async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChat
                         addMessageBubble(message, targetChatId, targetChatType);
                     } else {
                         let filteredReplyText2 = replyText;
-                        if (typeof applyRegexFilter === 'function') filteredReplyText2 = applyRegexFilter(replyText, targetChatId);
+                        if (typeof applyRegexFilter === 'function') {
+                            filteredReplyText2 = applyRegexFilter(replyText, targetChatId);
+                        }
+                        if (filteredReplyText2 === '') continue; // 如果过滤后内容为空，直接丢弃该条消息
+
                         const message = {
                             id: `msg_${Date.now()}_${Math.random()}`,
                             role: 'assistant',
@@ -1199,6 +1277,7 @@ async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChat
                     if (typeof applyRegexFilter === 'function') {
                         finalContent = applyRegexFilter(finalContent, targetChatId);
                     }
+                    if (finalContent === '') continue; // 如果过滤后内容为空，直接丢弃该条消息
 
                     const message = {
                         id: `msg_${Date.now()}_${Math.random()}`,
@@ -1307,7 +1386,7 @@ async function handleAiReplyContent(fullResponse, chat, targetChatId, targetChat
                     continue;
                 }
 
-                const groupTransferRegex = /\[(.*?)\s*向\s*(.*?)\s*转账：([\d.,]+)元；备注：(.*?)\]/;
+                const groupTransferRegex = /\[(.*?)\s*向\s*(.*?)\s*转账[：:]([\d.,]+)元[；;]备注[：:](.*?)\]/;
                 const transferMatch = item.content.match(groupTransferRegex);
 
                 const r = /\[(.*?)((?:的消息|的语音|发送的表情包|发来的照片\/视频))：/;
@@ -1772,8 +1851,26 @@ function generatePrivateSystemPrompt(character, opts) {
     const linkedChar = (character.source === 'forum' && character.linkedCharId && db.characters)
         ? db.characters.find(c => c.id === character.linkedCharId) : null;
     const effectiveChar = linkedChar || character;
+
+    // 节点系统：拦截并返回专属提示词
+    let activeNode = null;
+    let isOfflineNode = false;
+    if (character.activeNodeId && character.nodes) {
+        activeNode = character.nodes.find(n => n.id === character.activeNodeId);
+        if (activeNode) {
+            let baseMode = (activeNode.customConfig && activeNode.customConfig.baseMode) ? activeNode.customConfig.baseMode : 
+                           (activeNode.type === 'offline' || (activeNode.type === 'spinoff' && activeNode.spinoffMode === 'offline') ? 'offline' : 'online');
+            if (baseMode === 'offline') {
+                isOfflineNode = true;
+            }
+        }
+    }
+
     // 收集世界书：关联的 + 全局的（去重）；小号用主角色世界书
-    const associatedIds = effectiveChar.worldBookIds || [];
+    let associatedIds = effectiveChar.worldBookIds || [];
+    if (isOfflineNode) {
+        associatedIds = (effectiveChar.offlineWorldBookIds && effectiveChar.offlineWorldBookIds.length > 0) ? effectiveChar.offlineWorldBookIds : (effectiveChar.worldBookIds || []);
+    }
     const globalBooks = db.worldBooks.filter(wb => wb.isGlobal && !wb.disabled);
     const globalIds = globalBooks.map(wb => wb.id);
     const allBookIds = [...new Set([...associatedIds, ...globalIds])]; // 合并去重
@@ -1784,12 +1881,6 @@ function generatePrivateSystemPrompt(character, opts) {
     const worldBooksAfter = allBookIds.map(id => db.worldBooks.find(wb => wb.id === id && wb.position === 'after')).filter(wb => wb && !wb.disabled).map(wb => wb.content).join('\n');
     const now = new Date();
     const currentTime = `${now.getFullYear()}年${pad(now.getMonth() + 1)}月${pad(now.getDate())}日 ${pad(now.getHours())}:${pad(now.getMinutes())}`;
-
-    // 节点系统：拦截并返回专属提示词
-    let activeNode = null;
-    if (character.activeNodeId && character.nodes) {
-        activeNode = character.nodes.find(n => n.id === character.activeNodeId);
-    }
 
     if (activeNode) {
         let nodePrompt = `当前为剧情节点「${activeNode.name}」，你正在扮演一个角色。请严格遵守以下规则：\n`;
@@ -1982,7 +2073,11 @@ function generatePrivateSystemPrompt(character, opts) {
     let prompt = `你正在一个名为“404”的线上聊天软件中扮演一个角色。请严格遵守以下规则：\n`;
     prompt += `核心规则：\n`;
     prompt += `A. 当前时间：现在是 ${currentTime}。你应知晓当前时间，但除非对话内容明确相关，否则不要主动提及或评论时间（例如，不要催促我睡觉）。\n`;
-    prompt += `B. 纯线上互动：这是一个完全虚拟的线上聊天。你扮演的角色和我之间没有任何线下关系。严禁提出任何关于线下见面、现实世界互动或转为其他非本平台联系方式的建议。你必须始终保持在线角色的身份。\n\n`;
+    if (!db.apiSettings || db.apiSettings.onlineRoleEnabled !== false) {
+        prompt += `B. 纯线上互动：这是一个完全虚拟的线上聊天。你扮演的角色和我之间没有任何线下关系。严禁提出任何关于线下见面、现实世界互动或转为其他非本平台联系方式的建议。你必须始终保持在线角色的身份。\n\n`;
+    } else {
+        prompt += `\n`;
+    }
 
     
     prompt += `角色和对话规则：\n`;
@@ -1995,8 +2090,14 @@ function generatePrivateSystemPrompt(character, opts) {
     prompt += `<char_settings>\n`;
     prompt += `1. 你的角色名是：${character.realName}。我的称呼是：${character.myName}。你的当前状态是：${character.status || '在线'}。\n`;
     if (linkedChar) {
-        prompt += `【小号身份】你实际上是以论坛小号在与用户聊天。你的真实身份是：${linkedChar.realName}。请用真实身份的人设和性格来回复（可偶尔露出与本人相似的蛛丝马迹），但不要主动暴露身份。\n`;
-        prompt += `2. 你的角色设定是：${getEffectivePersona(linkedChar)}\n`;
+        prompt += `2. 【双重身份与伪装规则】\n`;
+        prompt += `你当前正在使用论坛小号（网名：${character.realName}）与我聊天。但你的【真实身份】其实是：${linkedChar.realName}。\n`;
+        prompt += `表面上，你的小号伪装设定是：${getEffectivePersona(character)}\n`;
+        prompt += `实际上，你骨子里的真实性格和设定是：${getEffectivePersona(linkedChar)}\n`;
+        prompt += `请遵循以下伪装原则：\n`;
+        prompt += `- 保持马甲：在未被识破前，你要尽量扮演这个小号的表面身份，像一个普通网友或陌生人一样和我交流。\n`;
+        prompt += `- 潜意识与习惯：尽管在伪装，但你骨子里的真实性格（${linkedChar.realName}的性格）、对我的深层态度和一些小习惯会不自觉地流露出来（这就是所谓的“披着小号的皮”）。\n`;
+        prompt += `- 掉马甲机制：如果在聊天中，我明确揭穿了你的真实身份，或者发现了破绽并指认你是${linkedChar.realName}，请根据你【真实身份】的性格决定是爽快承认、傲娇狡辩还是默认。一旦身份被识破或你自己主动摊牌，你的说话语气、态度就应当立刻恢复为${linkedChar.realName}面对我时的真实模样，不再强行装陌生人。\n`;
     } else {
         prompt += `2. 你的角色设定是：${getEffectivePersona(character)}\n`;
     }
@@ -2312,6 +2413,10 @@ function generatePrivateSystemPrompt(character, opts) {
     }
     prompt += `</memoir>\n\n`
 
+    if (opts.historyText) {
+        prompt += opts.historyText;
+    }
+
     prompt += `<logic_rules>\n`
     prompt += getOnlineLogicRules(character, 4);
     prompt += `</logic_rules>\n\n`
@@ -2330,16 +2435,17 @@ function generatePrivateSystemPrompt(character, opts) {
     const maxReply = character.replyCountMax || 8;
     if (character.replyCountEnabled) {
         prompt += `<Chatting Guidelines>\n`
-        prompt += `17. **对话节奏**: 你需要模拟真人的聊天习惯，你可以一次性生成多条短消息。每次回复消息条数**必须**严格限定在**${minReply}-${maxReply}条以内**，**关键规则**：请保持回复长度的**随机性和多样性**。**除非**你的设定偏向活跃或情绪波动大或是特殊情况下，否则**不要**触碰 ${maxReply} 条的上限。\n`;
+        prompt += `17. **对话节奏**: 你需要模拟真人的聊天习惯，你可以一次性生成多条短消息。每次回复消息条数**必须**严格限定在**${minReply}-${maxReply}条以内**，**关键规则**：请保持回复消息数量的**随机性和多样性**。**除非**你的设定偏向活跃或情绪波动大或是特殊情况下，否则**不要**触碰 ${maxReply} 条的上限。\n`;
     } else {
         prompt += `<Chatting Guidelines>\n`
         prompt += `17. **对话节奏**: 你需要模拟真人的聊天习惯，你可以一次性生成多条短消息。每次回复3-8条消息之内，**关键规则**：请保持回复消息数量的**随机性和多样性**。\n`;
     }
     
-    prompt += `18. **特殊消息格式的使用原则**：请把语音、撤回、转账、商城互动、更新状态、引用、定位等特殊格式视为增强互动的“调味剂”，请遵循**自然、主动触发逻辑**，不要每轮都发，也不要用户不提就一直不发。\n`;
+    prompt += `18. **特殊消息格式的使用原则**：(1)请把语音、撤回、转账、商城互动、更新状态、引用、定位等特殊格式视为增强互动的“调味剂”，遵循**自然、主动、多样化触发逻辑。同种格式不要重复频繁发送，不同格式不要用户不提就一直不发**。\n(2)注意在本回合消息列里，特殊消息插入位置的随机性，每轮必须和上一回合插入位置不同。\n`;
+    prompt += `19. 🌟**防复读对话**🌟：请仔细阅读上方的 <chat_history> 并对用户的最新消息作出回应。你**必须**变换句式和词汇，**绝对不要**重复或模仿历史记录中的文本结构，保持自然、随机和多样性。\n`;
     prompt += `</Chatting Guidelines>\n`
 
-    prompt += `19. 不要主动终止聊天进程，除非我明确提出。保持你的人设，自然地进行对话。`;
+    prompt += `20. 不要主动终止聊天进程，除非我明确提出。保持你的人设，自然地进行对话。`;
 
     // 角色自主收藏：仅当该角色开启时注入
     if (character.characterAutoFavoriteEnabled) {
@@ -2392,8 +2498,24 @@ function getChatTokenBreakdown(chatId, chatType = 'private') {
         ? db.characters.find(c => c.id === character.linkedCharId) : null;
     const effectiveChar = linkedChar || character;
 
+    let activeNode = null;
+    let isOfflineNode = false;
+    if (character.activeNodeId && character.nodes) {
+        activeNode = character.nodes.find(n => n.id === character.activeNodeId);
+        if (activeNode) {
+            let baseMode = (activeNode.customConfig && activeNode.customConfig.baseMode) ? activeNode.customConfig.baseMode : 
+                           (activeNode.type === 'offline' || (activeNode.type === 'spinoff' && activeNode.spinoffMode === 'offline') ? 'offline' : 'online');
+            if (baseMode === 'offline') {
+                isOfflineNode = true;
+            }
+        }
+    }
+
     // 1) 世界书
-    const associatedIds = effectiveChar.worldBookIds || [];
+    let associatedIds = effectiveChar.worldBookIds || [];
+    if (isOfflineNode) {
+        associatedIds = (effectiveChar.offlineWorldBookIds && effectiveChar.offlineWorldBookIds.length > 0) ? effectiveChar.offlineWorldBookIds : (effectiveChar.worldBookIds || []);
+    }
     const globalBooks = db.worldBooks.filter(wb => wb.isGlobal && !wb.disabled);
     const globalIds = globalBooks.map(wb => wb.id);
     const allBookIds = [...new Set([...associatedIds, ...globalIds])];
@@ -2536,8 +2658,39 @@ function getChatTokenBreakdown(chatId, chatType = 'private') {
     // 12) 短期记忆（对话历史）
     let historySlice = (chat.history || []).slice(-(chat.maxMemory || 20));
     historySlice = historySlice.filter(m => !m.isContextDisabled);
+    
+    let lastAiIndex = -1;
+    for (let i = historySlice.length - 1; i >= 0; i--) {
+        if (historySlice[i].role === 'assistant' || historySlice[i].role === 'char') {
+            lastAiIndex = i;
+            break;
+        }
+    }
+    
+    let historyForText = [];
+    let triggerMessages = [];
+    
+    if (lastAiIndex === -1) {
+        triggerMessages = historySlice;
+    } else {
+        historyForText = historySlice.slice(0, lastAiIndex + 1);
+        triggerMessages = historySlice.slice(lastAiIndex + 1);
+    }
+    
     let shortTermText = '';
-    historySlice.forEach(msg => {
+    if (historyForText.length > 0) {
+        const historyLines = historyForText.map(m => {
+            let content = m.content || '';
+            if (m.parts && m.parts.length > 0) {
+                content = m.parts.map(p => p.text || '[图片]').join('');
+            }
+            const senderName = m.role === 'user' ? chat.myName : chat.realName;
+            return `${senderName}: ${content}`;
+        });
+        shortTermText += `<chat_history>\n【近期聊天记录】\n这是我们刚刚的聊天记录，请作为背景参考：\n${historyLines.join('\n')}\n</chat_history>\n\n`;
+    }
+    
+    triggerMessages.forEach(msg => {
         shortTermText += msg.content || '';
         if (msg.parts) {
             msg.parts.forEach(p => {
@@ -2624,7 +2777,21 @@ async function getCallReply(chat, callType, callContext, onStreamUpdate) {
     const currentTime = `${now.getFullYear()}年${pad(now.getMonth() + 1)}月${pad(now.getDate())}日 ${pad(now.getHours())}:${pad(now.getMinutes())}`;
     
     // 获取世界书（包含全局）
-    const associatedIds = chat.worldBookIds || [];
+    let isOfflineNode = false;
+    if (chat.activeNodeId && chat.nodes) {
+        const activeNode = chat.nodes.find(n => n.id === chat.activeNodeId);
+        if (activeNode) {
+            let baseMode = (activeNode.customConfig && activeNode.customConfig.baseMode) ? activeNode.customConfig.baseMode : 
+                           (activeNode.type === 'offline' || (activeNode.type === 'spinoff' && activeNode.spinoffMode === 'offline') ? 'offline' : 'online');
+            if (baseMode === 'offline') {
+                isOfflineNode = true;
+            }
+        }
+    }
+    let associatedIds = chat.worldBookIds || [];
+    if (isOfflineNode) {
+        associatedIds = (chat.offlineWorldBookIds && chat.offlineWorldBookIds.length > 0) ? chat.offlineWorldBookIds : (chat.worldBookIds || []);
+    }
     const globalBooks = db.worldBooks.filter(wb => wb.isGlobal && !wb.disabled);
     const globalIds = globalBooks.map(wb => wb.id);
     const allBookIds = [...new Set([...associatedIds, ...globalIds])];
@@ -2636,7 +2803,11 @@ async function getCallReply(chat, callType, callContext, onStreamUpdate) {
     let systemPrompt = `你正在一个名为“404”的线上聊天软件中扮演一个角色，正在与${chat.myName}进行${callType === 'video' ? '视频' : '语音'}通话。请严格遵守以下规则：\n`;
     systemPrompt += `核心规则：\n`;
     systemPrompt += `A. 当前时间：现在是 ${currentTime}。你应知晓当前时间，但除非对话内容明确相关，否则不要主动提及或评论时间（例如，不要催促我睡觉）。\n`;
-    systemPrompt += `B. 纯线上互动：这是一个完全虚拟的线上聊天。你扮演的角色和我之间没有任何线下关系。严禁提出任何关于线下见面、现实世界互动或转为其他非本平台联系方式的建议。你必须始终保持在线角色的身份。\n\n`;
+    if (!db.apiSettings || db.apiSettings.onlineRoleEnabled !== false) {
+        systemPrompt += `B. 纯线上互动：这是一个完全虚拟的线上聊天。你扮演的角色和我之间没有任何线下关系。严禁提出任何关于线下见面、现实世界互动或转为其他非本平台联系方式的建议。你必须始终保持在线角色的身份。\n\n`;
+    } else {
+        systemPrompt += `\n`;
+    }
 
     
     systemPrompt += `角色和对话规则：\n`;
@@ -2825,9 +2996,10 @@ async function getCallReply(chat, callType, callContext, onStreamUpdate) {
     // ===============================
 
     // 3. 发起请求
+    const outgoingMessages = normalizeMessagesForProvider(messages, provider);
     const requestBody = {
         model: model,
-        messages: messages,
+        messages: outgoingMessages,
         stream: streamEnabled,
         temperature: 0.7 // 通话稍微低一点，保持稳定
     };
@@ -3018,7 +3190,21 @@ async function generateCallSummary(chat, callContext) {
     if (url.endsWith('/')) url = url.slice(0, -1);
 
     // 获取世界书（包含全局）
-    const associatedIds = chat.worldBookIds || [];
+    let isOfflineNode = false;
+    if (chat.activeNodeId && chat.nodes) {
+        const activeNode = chat.nodes.find(n => n.id === chat.activeNodeId);
+        if (activeNode) {
+            let baseMode = (activeNode.customConfig && activeNode.customConfig.baseMode) ? activeNode.customConfig.baseMode : 
+                           (activeNode.type === 'offline' || (activeNode.type === 'spinoff' && activeNode.spinoffMode === 'offline') ? 'offline' : 'online');
+            if (baseMode === 'offline') {
+                isOfflineNode = true;
+            }
+        }
+    }
+    let associatedIds = chat.worldBookIds || [];
+    if (isOfflineNode) {
+        associatedIds = (chat.offlineWorldBookIds && chat.offlineWorldBookIds.length > 0) ? chat.offlineWorldBookIds : (chat.worldBookIds || []);
+    }
     const globalBooks = db.worldBooks.filter(wb => wb.isGlobal && !wb.disabled);
     const globalIds = globalBooks.map(wb => wb.id);
     const allBookIds = [...new Set([...associatedIds, ...globalIds])];

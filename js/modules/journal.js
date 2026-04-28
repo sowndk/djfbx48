@@ -23,6 +23,7 @@ function setupMemoryJournalScreen() {
     const batchDeleteBtn = document.getElementById('journal-batch-delete-btn');
     const mergeBtn = document.getElementById('journal-merge-btn');
     const selectCountSpan = document.getElementById('journal-select-count');
+    const selectAllBtn = document.getElementById('journal-select-all-btn');
 
     let isMultiSelectMode = false;
     let selectedJournalIds = new Set();
@@ -66,6 +67,12 @@ function setupMemoryJournalScreen() {
         });
     }
 
+    if (selectAllBtn) {
+        selectAllBtn.addEventListener('click', () => {
+            toggleSelectAll();
+        });
+    }
+
     function toggleMultiSelectMode(active) {
         isMultiSelectMode = active;
         selectedJournalIds.clear();
@@ -96,6 +103,9 @@ function setupMemoryJournalScreen() {
                 const checkbox = card.querySelector('.journal-checkbox');
                 if (checkbox) checkbox.classList.remove('checked');
             });
+            
+            // 退出多选模式时重置全选按钮
+            if (selectAllBtn) selectAllBtn.textContent = '全选';
         }
     }
 
@@ -103,6 +113,46 @@ function setupMemoryJournalScreen() {
         if (selectCountSpan) {
             selectCountSpan.textContent = `已选 ${selectedJournalIds.size} 篇`;
         }
+        
+        // 更新全选按钮文字
+        if (selectAllBtn) {
+            const chat = (currentChatType === 'private') 
+                ? db.characters.find(c => c.id === currentChatId) 
+                : db.groups.find(g => g.id === currentChatId);
+            
+            if (chat && chat.memoryJournals) {
+                const totalCount = chat.memoryJournals.length;
+                const isAllSelected = selectedJournalIds.size === totalCount && totalCount > 0;
+                selectAllBtn.textContent = isAllSelected ? '取消全选' : '全选';
+            }
+        }
+    }
+
+    function toggleSelectAll() {
+        const chat = (currentChatType === 'private') 
+            ? db.characters.find(c => c.id === currentChatId) 
+            : db.groups.find(g => g.id === currentChatId);
+        
+        if (!chat || !chat.memoryJournals) return;
+        
+        const allJournalIds = chat.memoryJournals.map(j => j.id);
+        const isAllSelected = allJournalIds.every(id => selectedJournalIds.has(id));
+        
+        if (isAllSelected) {
+            // 取消全选
+            selectedJournalIds.clear();
+            document.querySelectorAll('.journal-checkbox').forEach(checkbox => {
+                checkbox.classList.remove('checked');
+            });
+        } else {
+            // 全选
+            allJournalIds.forEach(id => selectedJournalIds.add(id));
+            document.querySelectorAll('.journal-checkbox').forEach(checkbox => {
+                checkbox.classList.add('checked');
+            });
+        }
+        
+        updateSelectCount();
     }
 
     async function mergeJournals(journalIds) {
@@ -136,11 +186,11 @@ function setupMemoryJournalScreen() {
         summaryPrompt += `    - **严格控制数量**：只摘录最闪光、最不可替代的那几句。如果聊天记录平淡无奇或全是日常琐事，**请不要摘录任何原话**，以免破坏摘要的精简性。\n`;
         summaryPrompt += `5. **无升华**：不要进行价值升华、感悟或总结性评价，仅记录发生了什么。\n\n`;
 
-        summaryPrompt += `你的输出必须是一个JSON对象，包含以下两个字段：\n`;
-        summaryPrompt += `- 'title': 一个概括性的标题，例如“1月上旬·关于旅行的筹备与出发”。\n`;
-        summaryPrompt += `- 'content': 合并后的正文内容。\n\n`;
-
-        summaryPrompt += `Strictly output in JSON format only. Do not speak outside the JSON object.\n\n`;
+        summaryPrompt += `请严格使用以下 XML 标签格式输出你的结果，不要输出任何其他多余的解释：\n`;
+        summaryPrompt += `<journal>\n`;
+        summaryPrompt += `    <title>一个概括性的标题，例如“1月上旬·关于旅行的筹备与出发”</title>\n`;
+        summaryPrompt += `    <content>合并后的正文内容</content>\n`;
+        summaryPrompt += `</journal>\n\n`;
         summaryPrompt += `待合并的日记内容如下：\n\n${combinedContent}`;
 
         showToast('正在合并精简，请稍候...');
@@ -180,25 +230,26 @@ function setupMemoryJournalScreen() {
             const requestBody = {
                 model: model,
                 messages: [{ role: 'user', content: summaryPrompt }],
-                temperature: 0.7,
-                response_format: { type: "json_object" }, 
+                temperature: 0.7
             };
             const endpoint = `${url}/v1/chat/completions`;
             const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` };
 
             const rawContent = await fetchAiResponse(db.apiSettings, requestBody, headers, endpoint);
 
-            let cleanContent = rawContent.trim();
-            cleanContent = cleanContent.replace(/```json\s*/gi, '').replace(/```\s*/g, '');
-            cleanContent = cleanContent.trim();
+            const titleMatch = rawContent.match(/<title>([\s\S]*?)<\/title>/i);
+            const contentMatch = rawContent.match(/<content>([\s\S]*?)<\/content>/i);
 
-            const journalData = JSON.parse(cleanContent);
+            const journalData = {
+                title: titleMatch ? titleMatch[1].trim() : "合并日记",
+                content: contentMatch ? contentMatch[1].trim() : "内容提取失败。"
+            };
 
             const newJournal = {
                 id: `journal_${Date.now()}`,
                 range: { start: mergedStart, end: mergedEnd },
-                title: journalData.title || "合并日记",
-                content: journalData.content || "内容为空。",
+                title: journalData.title,
+                content: journalData.content,
                 createdAt: Date.now(),
                 chatId: currentChatId,
                 chatType: currentChatType,
@@ -626,11 +677,11 @@ async function generateJournal(start, end, includeFavorited = false, silent = fa
             summaryPrompt += `2. **精简准确**：只陈述事实，概括主要话题和事件，去除无关的闲聊细节。\n`;
             summaryPrompt += `3. **无升华**：不要进行价值升华、感悟或总结性评价，仅记录发生了什么。\n\n`;
 
-            summaryPrompt += `你的输出必须是一个JSON对象，包含以下两个字段：\n`;
-            summaryPrompt += `- 'title': 格式为“日期·核心事件”，例如“1月20日·讨论周末计划”。\n`;
-            summaryPrompt += `- 'content': 总结正文。分条列出主要讨论点或事件。\n\n`;
-
-            summaryPrompt += `Strictly output in JSON format only. Do not speak outside the JSON object.\n\n`;
+            summaryPrompt += `请严格使用以下 XML 标签格式输出你的结果，不要输出任何其他多余的解释：\n`;
+            summaryPrompt += `<journal>\n`;
+            summaryPrompt += `    <title>格式为“日期·核心事件”，例如“1月20日·讨论周末计划”</title>\n`;
+            summaryPrompt += `    <content>总结正文。分条列出主要讨论点或事件。</content>\n`;
+            summaryPrompt += `</journal>\n\n`;
             summaryPrompt += `聊天记录如下：\n\n---\n${(() => {
                 let lastTime = 0;
                 return messagesToSummarize.map(m => {
@@ -655,7 +706,21 @@ async function generateJournal(start, end, includeFavorited = false, silent = fa
             migrateJournalSettings(chat);
 
             // 1. 自动获取通用世界书 (Context) + 全局世界书
-            const associatedIds = chat.worldBookIds || [];
+            let isOfflineNode = false;
+            if (chat.activeNodeId && chat.nodes) {
+                const activeNode = chat.nodes.find(n => n.id === chat.activeNodeId);
+                if (activeNode) {
+                    let baseMode = (activeNode.customConfig && activeNode.customConfig.baseMode) ? activeNode.customConfig.baseMode : 
+                                   (activeNode.type === 'offline' || (activeNode.type === 'spinoff' && activeNode.spinoffMode === 'offline') ? 'offline' : 'online');
+                    if (baseMode === 'offline') {
+                        isOfflineNode = true;
+                    }
+                }
+            }
+            let associatedIds = chat.worldBookIds || [];
+            if (isOfflineNode) {
+                associatedIds = (chat.offlineWorldBookIds && chat.offlineWorldBookIds.length > 0) ? chat.offlineWorldBookIds : (chat.worldBookIds || []);
+            }
             const globalBooks = db.worldBooks.filter(wb => wb.isGlobal && !wb.disabled);
             const globalIds = globalBooks.map(wb => wb.id);
             const allBookIds = [...new Set([...associatedIds, ...globalIds])];
@@ -684,11 +749,11 @@ async function generateJournal(start, end, includeFavorited = false, silent = fa
     - **严格控制数量**：只摘录最闪光、最不可替代的那几句。如果聊天记录平淡无奇或全是日常琐事，**请不要摘录任何原话**，以免破坏摘要的精简性。
 5. **无升华**：不要进行价值升华、感悟或总结性评价，仅记录发生了什么。
 
-你的输出必须是一个JSON对象，包含以下两个字段：
-- 'title': 格式为“日期范围·核心事件”，例如“1月20日-1月22日·关于旅行计划的讨论”。
-- 'content': 总结正文。
-
-Strictly output in JSON format only. Do not speak outside the JSON object.
+请严格使用以下 XML 标签格式输出你的结果，不要输出任何其他多余的解释：
+<journal>
+    <title>格式为“日期范围·核心事件”，例如“1月20日-1月22日·关于旅行计划的讨论”</title>
+    <content>总结正文</content>
+</journal>
 
 聊天记录如下：\n\n---\n${(() => {
                 let lastTime = 0;
@@ -738,7 +803,7 @@ Strictly output in JSON format only. Do not speak outside the JSON object.
                     }
                 }
 
-                summaryPrompt += `请基于以上所有背景信息，总结以下聊天记录。你的输出必须是一个JSON对象，包含 'title' (年月日·一个简洁的标题) 和 'content' (完整的日记正文) 两个字段，​Strictly output in JSON format only. Do not speak outside the JSON object.聊天记录如下：\n\n---\n${(() => {
+                summaryPrompt += `请基于以上所有背景信息，总结以下聊天记录。请严格使用以下 XML 标签格式输出你的结果，不要输出任何其他多余的解释：\n<journal>\n    <title>年月日·一个简洁的标题</title>\n    <content>完整的日记正文</content>\n</journal>\n\n聊天记录如下：\n\n---\n${(() => {
                 let lastTime = 0;
                 return messagesToSummarize.map(m => {
                     let prefix = '';
@@ -778,25 +843,26 @@ Strictly output in JSON format only. Do not speak outside the JSON object.
         const requestBody = {
             model: model,
             messages: [{ role: 'user', content: summaryPrompt }],
-            temperature: 0.7,
-            response_format: { type: "json_object" }, 
+            temperature: 0.7
         };
         const endpoint = `${url}/v1/chat/completions`;
         const headers = { 'Content-Type': 'application/json', Authorization: `Bearer ${key}` };
 
         const rawContent = await fetchAiResponse(apiConfig, requestBody, headers, endpoint);
 
-        let cleanContent = rawContent.trim();
-        cleanContent = cleanContent.replace(/```json\s*/gi, '').replace(/```\s*/g, '');
-        cleanContent = cleanContent.trim();
+        const titleMatch = rawContent.match(/<title>([\s\S]*?)<\/title>/i);
+        const contentMatch = rawContent.match(/<content>([\s\S]*?)<\/content>/i);
 
-        const journalData = JSON.parse(cleanContent);
+        const journalData = {
+            title: titleMatch ? titleMatch[1].trim() : "无标题日记",
+            content: contentMatch ? contentMatch[1].trim() : "内容提取失败。"
+        };
 
         const newJournal = {
             id: `journal_${Date.now()}`,
             range: { start, end },
-            title: journalData.title || "无标题日记",
-            content: journalData.content || "内容为空。",
+            title: journalData.title,
+            content: journalData.content,
             createdAt: Date.now(),
             chatId: currentChatId,
             chatType: currentChatType,
@@ -874,7 +940,21 @@ Strictly output in JSON format only. Do not speak outside the JSON object.
 function migrateJournalSettings(chat) {
     if (!chat.journalStyleSettings) {
         const oldJournalIds = chat.journalWorldBookIds || [];
-        const chatCommonIds = chat.worldBookIds || [];
+        let isOfflineNode = false;
+        if (chat.activeNodeId && chat.nodes) {
+            const activeNode = chat.nodes.find(n => n.id === chat.activeNodeId);
+            if (activeNode) {
+                let baseMode = (activeNode.customConfig && activeNode.customConfig.baseMode) ? activeNode.customConfig.baseMode : 
+                               (activeNode.type === 'offline' || (activeNode.type === 'spinoff' && activeNode.spinoffMode === 'offline') ? 'offline' : 'online');
+                if (baseMode === 'offline') {
+                    isOfflineNode = true;
+                }
+            }
+        }
+        let chatCommonIds = chat.worldBookIds || [];
+        if (isOfflineNode) {
+            chatCommonIds = (chat.offlineWorldBookIds && chat.offlineWorldBookIds.length > 0) ? chat.offlineWorldBookIds : (chat.worldBookIds || []);
+        }
         
         // 1. 剔除重复项 (在通用里已存在的)
         const uniqueCustomIds = oldJournalIds.filter(id => !chatCommonIds.includes(id));

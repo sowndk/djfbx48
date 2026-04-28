@@ -248,7 +248,7 @@ function createMessageBubbleElement(message, isContinuous = false) {
     // 这里需要把 isThinking 从 message 里解构出来
     let {role, content, timestamp, id, transferStatus, giftStatus, stickerData, senderId, quote, isWithdrawn, originalContent, isStatusUpdate, isThinking} = message;
     // 角色消息中的 {{user}} 替换为当前对话的「我的名字」
-    if ((role === 'assistant' || role === 'char') && chat && chat.myName && typeof content === 'string') {
+    if (role === 'assistant' && chat && chat.myName && typeof content === 'string') {
         content = content.replace(/\{\{user\}\}/g, chat.myName);
     }
     // 【新增补丁】如果内容以 <thinking> 开头，强制标记为 isThinking
@@ -694,42 +694,6 @@ const contentMatch = content.match(/^\[.*?(?:消息|回复)[：:]([\s\S]+)\]$/);
         return wrapper;
     }
 
-    // 节点自定义输出格式：第三方（renderAsSystem）检查
-    if (currentChatType === 'private' && role !== 'user' && !isThinking) {
-        const char = db.characters.find(c => c.id === currentChatId);
-        if (char && char.activeNodeId) {
-            const activeNode = char.nodes && char.nodes.find(n => n.id === char.activeNodeId);
-            if (activeNode && activeNode.customConfig && Array.isArray(activeNode.customConfig.customOutputFormat)) {
-                const systemFormats = activeNode.customConfig.customOutputFormat.filter(f => typeof f === 'object' && f.renderAsSystem);
-                if (systemFormats.length > 0) {
-                    // 检查消息内容是否完全匹配某个 renderAsSystem 的自定义格式
-                    const trimmed = content.trim();
-                    const bracketMatch = trimmed.match(/^\[([^\]]+)\]$/);
-                    if (bracketMatch) {
-                        // 消息内容是一个完整的 [xxx] 格式，检查是否匹配某个第三方格式
-                        const isSystemFormat = systemFormats.some(f => {
-                            // 从格式模板中提取关键字前缀进行匹配，如 [检定结果：{xxx}] -> 匹配 [检定结果：
-                            const fmt = f.format || '';
-                            const prefixMatch = fmt.match(/^\[([^{}\]]+)/);
-                            if (prefixMatch) {
-                                return trimmed.startsWith('[' + prefixMatch[1]);
-                            }
-                            return false;
-                        });
-                        if (isSystemFormat) {
-                            wrapper.className = 'message-wrapper system-notification';
-                            wrapper.dataset.id = id;
-                            if (message.isContextDisabled) wrapper.classList.add('context-disabled');
-                            const displayText = bracketMatch[1];
-                            wrapper.innerHTML = `<div class="system-notification-bubble">${DOMPurify.sanitize(displayText)}</div>`;
-                            return wrapper;
-                        }
-                    }
-                }
-            }
-        }
-    }
-
     const isSent = (role === 'user');
     let avatarUrl, bubbleTheme, senderNickname = '';
     const themeKey = chat.theme || 'white_pink';
@@ -764,7 +728,7 @@ const contentMatch = content.match(/^\[.*?(?:消息|回复)[：:]([\s\S]+)\]$/);
     if (avatarClass.includes('avatar-invisible')) {
         wrapper.classList.add('avatar-invisible-layout');
     }
-    if (currentChatType === 'private' && chat.history && chat.history[0] && chat.history[0].id === id && (role === 'assistant' || role === 'char')) {
+    if (currentChatType === 'private' && chat.history && chat.history[0] && chat.history[0].id === id && role === 'assistant') {
         wrapper.classList.add('is-first-greeting');
     }
     const bubbleRow = document.createElement('div');
@@ -787,9 +751,7 @@ const contentMatch = content.match(/^\[.*?(?:消息|回复)[：:]([\s\S]+)\]$/);
     const textRegex = /\[(?:.+?)的消息[：:]([\s\S]+?)\]/;
     /* 用户定位 [我的位置：...] 或 角色定位 [XXX的位置：...] */
     const locationRegex = /\[(.+?)的位置[：:](.+?)(?:；距你约\s*([\d.]+)\s*(米|千米|公里))?\]/;
-    // 【新增】自定义 HTML 渲染包裹标签正则
-    const uwuxjcRegex = /<uwuxjc>([\s\S]*?)<\/uwuxjc>/i;
-
+    
     // 新版购物车小票格式: [A为B下单了：配送方式|总价|商品名 x数量]
     const shopOrderRegexNew = /\[(.*?)为(.*?)下单了[：:](.*?)\|(.*?)\|(.*?)\]/;
     // 代付请求格式: [A向B发起了代付请求:总价|商品名 x数量]
@@ -822,8 +784,7 @@ const contentMatch = content.match(/^\[.*?(?:消息|回复)[：:]([\s\S]+)\]$/);
     const imageRecogMatch = content.match(imageRecogRegex);
     const textMatch = content.match(textRegex);
     const locationMatch = content.match(locationRegex);
-        // 【新增】匹配 uwuxjc 标签
-    const uwuxjcMatch = content.match(uwuxjcRegex);
+    
     if (callRecordMatch) {
         // 匹配结果: [0]全文, [1]类型(视频/语音), [2]时间, [3]时长, [4]总结
         const type = callRecordMatch[1]; 
@@ -1404,42 +1365,13 @@ const contentMatch = content.match(/^\[.*?(?:消息|回复)[：:]([\s\S]+)\]$/);
     } else if (textMatch) {
         bubbleElement = document.createElement('div');
         bubbleElement.className = `message-bubble ${isSent ? 'sent' : 'received'}`;
-        let userText = textMatch[1].trim().replace(/$$发送时间:.*?$$/g, '').trim();
+        let userText = textMatch[1].trim().replace(/\[发送时间:.*?\]/g, '').trim();
         bubbleElement.innerHTML = `<span class="bubble-content">${DOMPurify.sanitize(userText)}</span>`;
         if (!chat.useCustomBubbleCss) {
             bubbleElement.style.backgroundColor = bubbleTheme.bg;
             bubbleElement.style.color = bubbleTheme.text;
         }
-        } else if (uwuxjcMatch) {
-        // 拦截 <uwuxjc> 标签并作为 HTML 渲染
-        bubbleElement = document.createElement('div');
-        bubbleElement.className = `message-bubble ${isSent ? 'sent' : 'received'} html-bubble`;
-        
-        // 宽度自动适配屏幕大小，允许横向滚动防止撑爆布局
-        bubbleElement.style.width = '100%';
-        bubbleElement.style.maxWidth = '100%';
-        bubbleElement.style.overflowX = 'auto';
-        
-        const htmlContent = uwuxjcMatch[1].trim().replace(/\[发送时间:.*?\]/g, '');
-        
-        if (htmlContent.includes('<!DOCTYPE html>') || htmlContent.includes('<html')) {
-            // iframe 模式：去掉初始高度，添加 onload 事件自动获取内部元素高度并自适应撑开
-            bubbleElement.innerHTML = `<iframe srcdoc="${htmlContent.replace(/"/g, '&quot;')}" scrolling="no" style="width: 100%; min-width: 250px; border: none; background: white; border-radius: 10px; overflow: hidden;" onload="this.style.height = (this.contentWindow.document.documentElement.scrollHeight + 20) + 'px';"></iframe>`;
-        } else {
-            // 直接插入节点模式：天然根据内容自动撑开高度
-            bubbleElement.innerHTML = DOMPurify.sanitize(htmlContent, { 
-                ADD_TAGS: ['style', 'div', 'span', 'table', 'tr', 'td', 'th', 'tbody', 'thead', 'button', 'input', 'img', 'svg', 'path', 'a', 'b', 'i', 'strong', 'em', 'h1', 'h2', 'h3', 'h4', 'h5', 'h6', 'p', 'ul', 'li', 'ol'], 
-                ADD_ATTR: ['style', 'class', 'id', 'href', 'src', 'width', 'height', 'viewBox', 'd', 'fill', 'stroke'] 
-            });
-        }
-        
-        if (!chat.useCustomBubbleCss) {
-            bubbleElement.style.backgroundColor = bubbleTheme.bg;
-            bubbleElement.style.color = bubbleTheme.text;
-        }
     } else if (message && Array.isArray(message.parts) && message.parts.length > 0 && message.parts[0].type === 'html') {
-
-
         bubbleElement = document.createElement('div');
         bubbleElement.className = `message-bubble ${isSent ? 'sent' : 'received'} html-bubble`;
         const htmlContent = message.parts[0].text;
